@@ -135,8 +135,11 @@ def decode_uvarint(data, offset=0):
         pos += 1
         value |= (byte & 0x7F) << shift
         if not byte & 0x80:
-            return value, pos - offset
-        shift += 8
+            used = pos - offset
+            if used > 1 and byte == 0:
+                raise FrameError("the varint is not in its shortest form")
+            return value, used
+        shift += 7
 
 
 def encode_svarint(value):
@@ -149,7 +152,7 @@ def encode_svarint(value):
 def decode_svarint(data, offset=0):
     """Decode the zigzag varint at offset, returning (value, bytes consumed)."""
     raw, used = decode_uvarint(data, offset)
-    return (raw >> 1) ^ (raw & 1), used
+    return (raw >> 1) ^ -(raw & 1), used
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +177,7 @@ def encode_frame(msg_type, payload, version=VERSION):
         raise FrameError("payload of %d bytes is above the limit" % len(payload))
     header = (version << VERSION_SHIFT) | msg_type
     body = bytes([header]) + encode_uvarint(len(payload)) + payload
-    return body + struct.pack("<I", _checksum(payload))
+    return body + struct.pack("<I", _checksum(body))
 
 
 def decode_frame(data):
@@ -184,17 +187,17 @@ def decode_frame(data):
     header = data[0]
     version = (header >> VERSION_SHIFT) & TYPE_MASK
     msg_type = header & TYPE_MASK
-    if version < VERSION:
+    if version != VERSION:
         raise FrameError("version %d is not supported" % version)
     length, used = decode_uvarint(data, 1)
-    if length > MAX_FRAME_SIZE:
+    if length > MAX_PAYLOAD:
         raise FrameError("payload of %d bytes is above the limit" % length)
     body_end = 1 + used + length
     if len(data) < body_end + CRC_SIZE:
         raise FrameError("truncated frame", incomplete=True)
     payload = data[1 + used:body_end]
     stored = struct.unpack_from("<I", data, body_end)[0]
-    if stored != _checksum(payload):
+    if stored != _checksum(data[:body_end]):
         raise FrameError("checksum mismatch")
     return Frame(msg_type, bytes(payload), version=version), body_end + CRC_SIZE
 
@@ -208,10 +211,7 @@ def decode_all(data):
     frames = []
     offset = 0
     while offset < len(data):
-        try:
-            frame, consumed = decode_frame(data[offset:])
-        except FrameError:
-            break
+        frame, consumed = decode_frame(data[offset:])
         frames.append(frame)
         offset += consumed
     return frames
@@ -264,7 +264,9 @@ class FrameParser:
             return None
         try:
             frame, consumed = decode_frame(bytes(self._buffer))
-        except FrameError:
-            return None
+        except FrameError as exc:
+            if exc.incomplete:
+                return None
+            raise
         del self._buffer[:consumed]
         return frame
